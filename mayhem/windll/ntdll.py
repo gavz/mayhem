@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-#  mayhem/version.py
+#  mayhem/windll/ntdll.py
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are
@@ -18,7 +18,7 @@
 #    this software without specific prior written permission.
 #
 #  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  'AS IS' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
 #  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
 #  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
 #  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
@@ -30,20 +30,65 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-import collections
+import ctypes
 
-version_info = collections.namedtuple('version_info', ('major', 'minor', 'micro'))(0, 3, 0)
+from . import kernel32 as m_k32
+import mayhem.datatypes.windows as wintypes
 
-version_label = 'alpha'
-version = "{0}.{1}.{2}".format(version_info.major, version_info.minor, version_info.micro)
+_ntdll = ctypes.windll.ntdll
 
-# distutils_version is compatible with distutils.version classes
-distutils_version = version
+NtAllocateVirtualMemory = m_k32._patch_winfunctype(
+	_ntdll.NtAllocateVirtualMemory,
+	wintypes.NTSTATUS,
+	(
+		wintypes.HANDLE,
+		ctypes.POINTER(wintypes.PVOID),
+		wintypes.ULONG_PTR,
+		wintypes.PSIZE_T,
+		wintypes.ULONG,
+		wintypes.ULONG
+	)
+)
 
-if version_label:
-	version += '-' + version_label
-	distutils_version += version_label[0]
-	if version_label[-1].isdigit():
-		distutils_version += version_label[-1]
-	else:
-		distutils_version += '0'
+NtDeviceIoControlFile = m_k32._patch_winfunctype(
+	_ntdll.NtDeviceIoControlFile,
+	wintypes.NTSTATUS,
+	(
+		wintypes.HANDLE,
+		wintypes.HANDLE,
+		ctypes.c_void_p,
+		wintypes.PVOID,
+		wintypes.PIO_STATUS_BLOCK,
+		wintypes.ULONG,
+		wintypes.PVOID,
+		wintypes.ULONG,
+		wintypes.PVOID,
+		wintypes.ULONG
+	)
+)
+
+NtQueryInformationProcess = m_k32._patch_winfunctype(
+	_ntdll.NtQueryInformationProcess,
+	wintypes.NTSTATUS,
+	(
+		wintypes.HANDLE,
+		wintypes.DWORD,
+		wintypes.PVOID,
+		wintypes.ULONG,
+		wintypes.PULONG
+	)
+)
+
+NtSetCachedSigningLevel = m_k32._patch_winfunctype(
+	_ntdll.NtSetCachedSigningLevel,
+	wintypes.NTSTATUS,
+	(
+		wintypes.ULONG,
+		wintypes.SE_SIGNING_LEVEL,
+		wintypes.PHANDLE,
+		wintypes.ULONG,
+		wintypes.HANDLE
+	)
+)
+
+address = m_k32.GetModuleHandleW('ntdll.dll')

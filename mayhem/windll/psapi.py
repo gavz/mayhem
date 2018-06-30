@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-#  mayhem/datatypes/structure.py
+#  mayhem/windll/psapi.py
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are
@@ -32,5 +32,25 @@
 
 import ctypes
 
-class MayhemStructure(ctypes.Structure):
-	pass
+from . import kernel32 as m_k32
+import mayhem.datatypes.windows as wintypes
+
+_psapi = ctypes.windll.psapi
+
+if hasattr(_psapi, 'GetModuleFileNameExA'):
+	# https://msdn.microsoft.com/en-us/library/windows/desktop/ms683198(v=vs.85).aspx
+	GetModuleFileNameExA = m_k32._patch_winfunctype(
+		_psapi.GetModuleFileNameExA,
+		wintypes.DWORD,
+		(wintypes.HANDLE, wintypes.HMODULE, wintypes.LPSTR, wintypes.DWORD)
+	)
+
+if hasattr(_psapi, 'GetModuleFileNameExW'):
+	# https://msdn.microsoft.com/en-us/library/windows/desktop/ms683198(v=vs.85).aspx
+	GetModuleFileNameExW = m_k32._patch_winfunctype(
+		_psapi.GetModuleFileNameExW,
+		wintypes.DWORD,
+		(wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD)
+	)
+
+address = m_k32.GetModuleHandleW('psapi.dll')

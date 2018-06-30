@@ -1,17 +1,17 @@
-The mayhem Package
-==================
+Mayhem Documentation
+====================
 
-Contents:
+The Mayhem packages aims to provide a Python interface for the programmatic
+manipulation of executable files at runtime on both the Linux and Windows
+platforms.
+
+The source code is available on the `GitHub homepage`_.
 
 .. toctree::
-   :maxdepth: 4
+   :maxdepth: 2
+   :caption: Contents:
 
-   mayhem.rst
-   mayhem.proc.rst
-   mayhem.proc.linux.rst
-   mayhem.proc.native.rst
-   mayhem.proc.windows.rst
-   mayhem.utilities.rst
+   mayhem/index.rst
 
 Indices and tables
 ==================
@@ -19,3 +19,5 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+.. _GitHub homepage: https://github.com/zeroSteiner/mayhem

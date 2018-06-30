@@ -31,6 +31,7 @@
 #
 
 import os
+import collections
 import ctypes
 import ctypes.util
 import select
@@ -39,10 +40,11 @@ import signal
 import platform
 import subprocess
 
-from mayhem.proc import Process, ProcessError, Hook, MemoryRegion
-from mayhem.datatypes import elf
-from mayhem.utilities import architecture_is_32bit, architecture_is_64bit, struct_pack, struct_unpack
+import mayhem.datatypes.elf
+import mayhem.proc
+import mayhem.utilities
 
+elf = mayhem.datatypes.elf
 libc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
 ptrace = libc.ptrace
 ptrace.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
@@ -83,7 +85,7 @@ PTRACE_ATTACH = 16
 PTRACE_DETACH = 17
 PTRACE_SYSCALL = 24
 
-class LinuxMemoryRegion(MemoryRegion):
+class LinuxMemoryRegion(mayhem.proc.MemoryRegion):
 	"""Describe a memory region on Linux."""
 	def __init__(self, addr_low, addr_high, perms, pathname=None):
 		self.pathname = pathname
@@ -96,14 +98,11 @@ class LinuxMemoryRegion(MemoryRegion):
 		else:
 			return "{0:08x}-{1:08x} {2}".format(self.addr_low, self.addr_high, self.perms)
 
-class LinuxProcessError(ProcessError):
+class LinuxProcessError(mayhem.proc.ProcessError):
 	def __init__(self, *args, **kwargs):
-		self.errno = None
+		self.errno = kwargs.pop('errno', None)
 		"""The libc error number at the time the exception was raised."""
-		if 'errno' in kwargs:
-			self.errno = kwargs['errno']
-			del kwargs['errno']
-		ProcessError.__init__(self, *args, **kwargs)
+		super(LinuxProcessError, self).__init__(*args, **kwargs)
 
 def get_errno():
 	"""
@@ -126,7 +125,7 @@ def parse_proc_maps(pid):
 	:return: The parsed memory regions for *pid*.
 	:rtype: dict
 	"""
-	maps = {}
+	_maps = collections.deque()
 	maps_h = open('/proc/' + str(pid) + '/maps', 'r')
 	for memory_region in maps_h:
 		memory_region = memory_region[:-1]
@@ -134,23 +133,21 @@ def parse_proc_maps(pid):
 		if memory_region.find('/') != -1:
 			pathname = memory_region[memory_region.find('/'):]
 		memory_region = memory_region.split()
-		try:
-			addr_low = long(memory_region[0].split('-')[0], 16)
-			addr_high = long(memory_region[0].split('-')[1], 16)
-			perms = memory_region[1]
-			if pathname is None and len(memory_region) == 6:
-				pathname = memory_region[5]
-		except:
-			continue
-		maps[addr_low] = LinuxMemoryRegion(addr_low, addr_high, perms, pathname)
-	return maps
+		addr_low, _, addr_high = memory_region[0].partition('-')
+		addr_low = int(addr_low, 16)
+		addr_high = int(addr_high, 16)
+		perms = memory_region[1]
+		if pathname is None and len(memory_region) == 6:
+			pathname = memory_region[5]
+		_maps.append(LinuxMemoryRegion(addr_low, addr_high, perms, pathname))
+	return collections.OrderedDict((mr.addr_low, mr) for mr in sorted(_maps, key=lambda mr: mr.addr_low))
 
 def architecture_is_supported(arch):
-	return architecture_is_32bit(arch) or architecture_is_64bit(arch)
+	return mayhem.utilities.architecture_is_32bit(arch) or mayhem.utilities.architecture_is_64bit(arch)
 
 def flags(flags):
 	supported_operators = ['|', '+', '-', '^']
-	if isinstance(flags, int) or isinstance(flags, long):
+	if isinstance(flags, int):
 		return flags
 	if flags[0] == '(' and flags[-1] == ')':
 		flags = flags[1:-1]
@@ -179,17 +176,17 @@ def flags(flags):
 			parsed_flags = eval(str(parsed_flags) + last_operator + str(part))
 	return parsed_flags
 
-class LinuxProcess(Process):
+class LinuxProcess(mayhem.proc.ProcessBase):
 	"""This class represents a process in a POSIX Linux environment."""
 	def __init__(self, pid=None, exe=None):
 		if platform.system() != 'Linux':
 			raise RuntimeError('incompatible platform')
 		# Ensure that we are running in a version of python that matches the native architecture of the system.
 		if platform.architecture()[0] == '32bit':
-			if not architecture_is_32bit(platform.machine()):
+			if not mayhem.utilities.architecture_is_32bit(platform.machine()):
 				raise LinuxProcessError('Running a 32-bit version of Python on a non x86 system is not supported')
 		elif platform.architecture()[0] == '64bit':
-			if not architecture_is_64bit(platform.machine()):
+			if not mayhem.utilities.architecture_is_64bit(platform.machine()):
 				raise LinuxProcessError('Running a 64-bit version of Python on a non x86-64 system is not supported')
 		else:
 			raise LinuxProcessError('Could not determine the Python version')
@@ -207,11 +204,10 @@ class LinuxProcess(Process):
 		self.pid = pid
 		self.exe_file = os.readlink('/proc/' + str(self.pid) + '/exe')
 		ei_ident = open(self.exe_file, 'rb').read(elf.constants.EI_NIDENT)
-		ei_ident = map(ord, ei_ident)
 		if ei_ident[elf.constants.EI_CLASS] == elf.constants.ELFCLASS32:
 			self.__arch__ = 'x86'
 		elif ei_ident[elf.constants.EI_CLASS] == elf.constants.ELFCLASS64:
-			if architecture_is_32bit(platform.machine()):
+			if mayhem.utilities.architecture_is_32bit(platform.machine()):
 				raise LinuxProcessError('Controlling a 64-bit process from a 32-bit process is not supported')
 			self.__arch__ = 'x86_64'
 		else:
@@ -220,22 +216,22 @@ class LinuxProcess(Process):
 			Exception('could not open PID')
 		os.waitpid(pid, 0)
 		self._installed_hooks = []
-		self._update_maps()
 
 	def _signal_sigchld(self, signum, frame):
-		status = os.waitpid(self.pid, os.WNOHANG)
+		os.waitpid(self.pid, os.WNOHANG)
 
-	def _update_maps(self):
-		self.maps = parse_proc_maps(self.pid)
+	@property
+	def maps(self):
+		return parse_proc_maps(self.pid)
 
 	def get_proc_attribute(self, attribute):
 		requested_attribute = attribute
 		if attribute.startswith('&'):
 			attribute = attribute[1:] + '_addr'
 		if attribute.startswith('elf_'):
-			if architecture_is_32bit(self.__arch__):
+			if mayhem.utilities.architecture_is_32bit(self.__arch__):
 				attribute = 'elf32_' + attribute[4:]
-			elif architecture_is_64bit(self.__arch__):
+			elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 				attribute = 'elf64_' + attribute[4:]
 		if hasattr(self, '_get_attr_' + attribute):
 			return getattr(self, '_get_attr_' + attribute)()
@@ -251,12 +247,13 @@ class LinuxProcess(Process):
 				attribute = 'Elf64_' + attribute[6:].title()
 				if hasattr(elf, attribute):
 					return self._read_structure_from_memory(address, getattr(elf, attribute))
-		raise ProcessError('Unknown Attribute: ' + requested_attribute)
+		raise mayhem.proc.ProcessError('Unknown Attribute: ' + requested_attribute)
 
 	def _get_attr_elf32_ehdr_addr(self):
-		exe_maps = filter(lambda x: x.pathname == self.exe_file, self.maps.values())
-		for mem_region in exe_maps:
-			if self.read_memory(mem_region.addr_low, 4) == "\x7fELF":
+		for mem_region in self.maps.values():
+			if mem_region.pathname != self.exe_file:
+				continue
+			if self.read_memory(mem_region.addr_low, 4) == b'\x7fELF':
 				return mem_region.addr_low
 		raise LinuxProcessError('could not locate ehdr')
 
@@ -285,9 +282,10 @@ class LinuxProcess(Process):
 		return phdr.p_vaddr
 
 	def _get_attr_elf64_ehdr_addr(self):
-		exe_maps = filter(lambda x: x.pathname == self.exe_file, self.maps.values())
-		for mem_region in exe_maps:
-			if self.read_memory(mem_region.addr_low, 4) == "\x7fELF":
+		for mem_region in self.maps.values():
+			if mem_region.pathname != self.exe_file:
+				continue
+			if self.read_memory(mem_region.addr_low, 4) == b'\x7fELF':
 				return mem_region.addr_low
 		raise LinuxProcessError('could not locate ehdr')
 
@@ -316,9 +314,9 @@ class LinuxProcess(Process):
 		return phdr.p_vaddr
 
 	def _get_attr_got_addr(self):
-		if architecture_is_32bit(self.__arch__):
+		if mayhem.utilities.architecture_is_32bit(self.__arch__):
 			dyn_struct = elf.Elf32_Dyn
-		elif architecture_is_64bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 			dyn_struct = elf.Elf64_Dyn
 		else:
 			raise LinuxProcessError('unsupported architecture: ' + repr(self.__arch__))
@@ -333,32 +331,34 @@ class LinuxProcess(Process):
 
 	def _get_attr_link_map_addr(self):
 		got_addr = self.get_proc_attribute('got_addr')
-		if architecture_is_32bit(self.__arch__):
+		if mayhem.utilities.architecture_is_32bit(self.__arch__):
 			return struct.unpack('II', self.read_memory(got_addr, 8))[1]
-		elif architecture_is_64bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 			return struct.unpack('QQ', self.read_memory(got_addr, 16))[1]
+		else:
+			raise LinuxProcessError('unsupported architecture: ' + repr(self.__arch__))
 
 	def _get_function_address(self, mod_name, func_name):
-		if architecture_is_32bit(self.__arch__):
+		if mayhem.utilities.architecture_is_32bit(self.__arch__):
 			ehdr_struct = elf.Elf32_Ehdr
 			shdr_struct = elf.Elf32_Shdr
 			sym_struct = elf.Elf32_Sym
-		elif architecture_is_64bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 			ehdr_struct = elf.Elf64_Ehdr
 			shdr_struct = elf.Elf64_Shdr
 			sym_struct = elf.Elf64_Sym
 		else:
 			raise LinuxProcessError('unsupported architecture: ' + repr(self.__arch__))
 
-		ehdr_addr = None
+		func_name = func_name.encode('utf-8') + b'\x00'
 		if os.path.isabs(mod_name):
-			exe_maps = filter(lambda x: x.pathname == mod_name, self.maps.values())
+			exe_maps = tuple(mr for mr in self.maps.values() if mr.pathname == mod_name)
 			filename = mod_name
 		else:
-			exe_maps = filter(lambda x: x.pathname != None and os.path.basename(x.pathname).startswith(mod_name), self.maps.values())
+			exe_maps = tuple(mr for mr in self.maps.values() if mr.pathname and os.path.basename(mr.pathname).startswith(mod_name))
 			filename = exe_maps[0].pathname
 		handle = open(filename, 'rb')
-		ehdr = struct_unpack(ehdr_struct, handle.read(ctypes.sizeof(ehdr_struct)))
+		ehdr = mayhem.utilities.struct_unpack(ehdr_struct, handle.read(ctypes.sizeof(ehdr_struct)))
 
 		# get the shdrs
 		handle.seek(ehdr.e_shoff, os.SEEK_SET)
@@ -367,10 +367,8 @@ class LinuxProcess(Process):
 		shdrs = _shdrs()
 		ctypes.memmove(ctypes.byref(shdrs), data, len(data))
 
-		strtab = 0
-		symtab = 0
-		for idx in range(len(shdrs)):
-			shdr = shdrs[idx]
+		symtab = strtab = 0
+		for idx, shdr in enumerate(shdrs):
 			if shdr.sh_type == elf.constants.SHT_SYMTAB or shdr.sh_type == elf.constants.SHT_DYNSYM:
 				if not (shdr.sh_entsize and shdr.sh_size):
 					continue
@@ -378,43 +376,35 @@ class LinuxProcess(Process):
 			elif shdr.sh_type == elf.constants.SHT_STRTAB:
 				if idx != ehdr.e_shstrndx:
 					strtab = idx
-			if symtab == 0 or strtab == 0:
+			if not (symtab and strtab):
 				continue
 			symh = shdrs[symtab]
 			strh = shdrs[strtab]
 			handle.seek(strh.sh_offset, os.SEEK_SET)
 			strsymtbl = handle.read(strh.sh_size)
-			sym_num = symh.sh_size / symh.sh_entsize
+			sym_num = symh.sh_size // symh.sh_entsize
 			_syms = (sym_struct * sym_num)
 			syms = _syms()
 			handle.seek(symh.sh_offset, os.SEEK_SET)
 			ctypes.memmove(ctypes.byref(syms), handle.read(ctypes.sizeof(syms)), ctypes.sizeof(syms))
-			for idx in range(1, len(syms)):
-				sym = syms[idx]
-				name = ""
+			for sym in syms[1:]:
 				if sym.st_name == 0:
 					continue
-				name_end = strsymtbl.find('\x00', sym.st_name)
-				if strsymtbl[sym.st_name:name_end] != func_name:
+				if strsymtbl[sym.st_name:(sym.st_name + len(func_name))] != func_name:
 					continue
-				address = sym.st_value
-				if filter(lambda mr: (address > mr.addr_low and address < mr.addr_high), exe_maps):
-					return address
-				else:
-					return address + sorted(exe_maps, key=lambda mr: mr.addr_low)[0].addr_low
-			strtab = 0
-			symtab = 0
-		raise ProcessError('unable to locate function')
+				return sym.st_value
+			symtab = strtab = 0
+		raise LinuxProcessError('unable to locate function')
 
 	def _call_function(self, function_address, *args):
 		if len(args) > 6:
 			raise Exception('can not pass more than 6 arguments')
 		registers_backup = self._get_registers()
-		if architecture_is_32bit(self.__arch__):
+		if mayhem.utilities.architecture_is_32bit(self.__arch__):
 			registers = {'eip': function_address, 'eax': function_address}
 			self._set_registers(registers)
 			backup_sp = self.read_memory(registers_backup['esp'], 4)
-			self.write_memory(registers_backup['esp'], '\x00\x00\x00\x00')
+			self.write_memory(registers_backup['esp'], b'\x00\x00\x00\x00')
 			for i in range(len(args)):
 				stack_cursor = registers_backup['esp'] + ((i + 1) * 4)
 				backup_sp += self.read_memory(stack_cursor, 4)
@@ -427,27 +417,27 @@ class LinuxProcess(Process):
 			self.write_memory(registers_backup['esp'], backup_sp)
 			ending_ip = self._get_registers()['eip']
 			result = self._get_registers()['eax']
-		elif architecture_is_64bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 			registers = {'rip': function_address, 'rax': function_address}
 			arg_registers = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
 			for i in range(len(args)):
 				registers[arg_registers[i]] = args[i]
 			self._set_registers(registers)
 			backup_sp = self.read_memory(registers_backup['rsp'], 8)
-			self.write_memory(registers_backup['rsp'], '\x00\x00\x00\x00\x00\x00\x00\x00')
+			self.write_memory(registers_backup['rsp'], b'\x00\x00\x00\x00\x00\x00\x00\x00')
 			self._ptrace(PTRACE_CONT)
 			wait_result = os.waitpid(self.pid, 0)
 			self.write_memory(registers_backup['rsp'], backup_sp)
 			ending_ip = self._get_registers()['rip']
 			result = self._get_registers()['rax']
 		self._set_registers(registers_backup)
-		if (os.WSTOPSIG(wait_result[1]) == signal.SIGSEGV) and (ending_ip != 0):
+		if os.WSTOPSIG(wait_result[1]) == signal.SIGSEGV and ending_ip != 0:
 			raise LinuxProcessError('segmentation fault')
 		return result
 
 	def _read_structure_from_memory(self, address, structure):
 		structure_data = self.read_memory(address, ctypes.sizeof(structure))
-		return struct_unpack(structure, structure_data)
+		return mayhem.utilities.struct_unpack(structure, structure_data)
 
 	def _ptrace(self, command, arg1=0, arg2=0, check_error=True):
 		return ptrace(command, self.pid, arg1, arg2, check_error=check_error)
@@ -461,7 +451,7 @@ class LinuxProcess(Process):
 			raise LinuxProcessError('Error: PTRACE_GETREGS', errno=get_errno())
 		registers = {}
 		# constants from sys/reg.h
-		if architecture_is_32bit(platform.machine()):
+		if mayhem.utilities.architecture_is_32bit(platform.machine()):
 			registers['ebx'] = raw_registers[0]
 			registers['ecx'] = raw_registers[1]
 			registers['edx'] = raw_registers[2]
@@ -479,7 +469,7 @@ class LinuxProcess(Process):
 			registers['eflags'] = raw_registers[14]
 			registers['esp'] = raw_registers[15]
 			registers['ss'] = raw_registers[16]
-		elif architecture_is_64bit(platform.machine()):
+		elif mayhem.utilities.architecture_is_64bit(platform.machine()):
 			registers['r15'] = raw_registers[0]
 			registers['r14'] = raw_registers[1]
 			registers['r13'] = raw_registers[2]
@@ -507,7 +497,7 @@ class LinuxProcess(Process):
 			registers['es'] = raw_registers[24]
 			registers['fs'] = raw_registers[25]
 			registers['gs'] = raw_registers[26]
-			if architecture_is_32bit(self.__arch__):
+			if mayhem.utilities.architecture_is_32bit(self.__arch__):
 				converted_registers = {}
 				converted_registers['ebx'] = registers['rbx']
 				converted_registers['ecx'] = registers['rcx']
@@ -537,7 +527,7 @@ class LinuxProcess(Process):
 		_raw_registers = (ctypes.c_ulong * 32)
 		raw_registers = _raw_registers()
 		# constants from sys/reg.h
-		if architecture_is_32bit(platform.machine()):
+		if mayhem.utilities.architecture_is_32bit(platform.machine()):
 			raw_registers[0] = old_registers['ebx']
 			raw_registers[1] = old_registers['ecx']
 			raw_registers[2] = old_registers['edx']
@@ -555,8 +545,8 @@ class LinuxProcess(Process):
 			raw_registers[14] = old_registers['eflags']
 			raw_registers[15] = old_registers['esp']
 			raw_registers[16] = old_registers['ss']
-		elif architecture_is_64bit(platform.machine()):
-			if architecture_is_32bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(platform.machine()):
+			if mayhem.utilities.architecture_is_32bit(self.__arch__):
 				_raw_registers = (ctypes.c_ulong * 32)
 				raw_registers = _raw_registers()
 				if self._ptrace(PTRACE_GETREGS, 0, ctypes.byref(raw_registers)) != 0:
@@ -612,32 +602,27 @@ class LinuxProcess(Process):
 
 	def _allocate_malloc(self, size):
 		malloc_addr = None
-		malloc_locations = ['libc-', 'ld-linux.so']
-		for lib in malloc_locations:
+		for lib in ('libc-', 'ld-linux.so'):
 			try:
 				malloc_addr = self._get_function_address(lib, 'malloc')
-				break
-			except ProcessError:
-				pass
+			except mayhem.proc.ProcessError:
+				continue
+			break
 		if malloc_addr is None:
-			raise ProcessError('unable to locate function')
-		address = self._call_function(malloc_addr, size)
-		self._update_maps()
-		return address
+			raise mayhem.proc.ProcessError('unable to locate function')
+		return self._call_function(malloc_addr, size)
 
 	def _free_free(self, address):
 		free_addr = None
-		free_locations = ['libc-', 'ld-linux.so']
-		for lib in free_locations:
+		for lib in ('libc-', 'ld-linux.so'):
 			try:
 				free_addr = self._get_function_address(lib, 'free')
-				break
-			except ProcessError:
-				pass
+			except mayhem.proc.ProcessError:
+				continue
+			break
 		if free_addr is None:
-			raise ProcessError('unable to locate function')
+			raise LinuxProcessError('unable to locate function')
 		self._call_function(free_addr, address)
-		self._update_maps()
 		return
 
 	def _allocate_mmap(self, size, address, permissions, mmap_flags=None):
@@ -652,24 +637,21 @@ class LinuxProcess(Process):
 				mmap_flags = flags('MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED')
 		else:
 			mmap_flags = flags(mmap_flags)
-		address = self._call_function(mmap_addr, address, size, permissions, mmap_flags, -1, 0)
-		self._update_maps()
-		return address
+		return self._call_function(mmap_addr, address, size, permissions, mmap_flags, -1, 0)
 
 	def _free_munmap(self, address, size):
 		munmap_addr = self._get_function_address('libc-', 'munmap')
 		result = self._call_function(munmap_addr, address, size)
-		if (result != 0):
+		if result != 0:
 			raise LinuxProcessError('Error: munmap')
-		self._update_maps()
 		return
 
 	def install_hook(self, mod_name, new_address, name=None, ordinal=None):
-		if architecture_is_32bit(self.__arch__):
+		if mayhem.utilities.architecture_is_32bit(self.__arch__):
 			lm_struct = elf.Elf32_Link_Map
 			dyn_struct = elf.Elf32_Dyn
 			sym_struct = elf.Elf32_Sym
-		elif architecture_is_64bit(self.__arch__):
+		elif mayhem.utilities.architecture_is_64bit(self.__arch__):
 			lm_struct = elf.Elf64_Link_Map
 			dyn_struct = elf.Elf64_Dyn
 			sym_struct = elf.Elf64_Sym
@@ -686,7 +668,7 @@ class LinuxProcess(Process):
 			validate_name = lambda lm: bool(os.path.split(self.read_memory_string(lm.l_name))[-1].startswith(mod_name))
 		while not validate_name(lm):
 			if lm.l_next == 0:
-				raise ProcessError('unable to locate shared library')
+				raise mayhem.proc.ProcessError('unable to locate shared library')
 			lm = self._read_structure_from_memory(lm.l_next, lm_struct)
 		idx = 0
 		dyn = self._read_structure_from_memory(lm.l_ld, dyn_struct)
@@ -696,14 +678,13 @@ class LinuxProcess(Process):
 		while dyn.d_tag:
 			idx += 1
 			if dyn.d_tag == elf.constants.DT_HASH:
-				#nchains = struct.unpack('I', self.read_memory(dyn.d_un.d_ptr + lm.l_addr + ctypes.sizeof(ctypes.c_int), ctypes.sizeof(ctypes.c_int)))[0]
 				nchains = struct.unpack('I', self.read_memory(dyn.d_un.d_ptr + ctypes.sizeof(ctypes.c_int), ctypes.sizeof(ctypes.c_int)))[0]
 			elif dyn.d_tag == elf.constants.DT_STRTAB:
 				strtab = dyn.d_un.d_ptr
 			elif dyn.d_tag == elf.constants.DT_SYMTAB:
 				symtab = dyn.d_un.d_ptr
 			dyn = self._read_structure_from_memory(lm.l_ld + (ctypes.sizeof(dyn_struct) * idx), dyn_struct)
-		for idx in xrange(0, nchains):
+		for idx in range(0, nchains):
 			sym = self._read_structure_from_memory(symtab + (ctypes.sizeof(sym_struct) * idx), sym_struct)
 			if (sym.st_info & 0xf) != elf.constants.STT_FUNC:
 				continue
@@ -711,26 +692,24 @@ class LinuxProcess(Process):
 				sym_addr = (symtab + (ctypes.sizeof(sym_struct) * idx))
 				old_address = lm.l_addr + sym.st_value
 				sym.st_value = (lm.l_addr - new_address)
-				self.write_memory(sym_addr, struct_pack(sym))
-				hook = Hook('eat', (sym_addr + sym_struct.st_value.offset), old_address, new_address)
+				self.write_memory(sym_addr, mayhem.utilities.struct_pack(sym))
+				hook = mayhem.proc.Hook('eat', (sym_addr + sym_struct.st_value.offset), old_address, new_address)
 				self._installed_hooks.append(hook)
 				return hook
-		raise ProcessError('unable to locate function')
+		raise mayhem.proc.ProcessError('unable to locate function')
 
 	def allocate(self, size=0x400, address=None, permissions=None):
 		permissions = (permissions or 'PROT_READ | PROT_WRITE | PROT_EXEC')
-		if not architecture_is_supported(self.__arch__):
-			raise LinuxProcessError('unsupported architecture: ' + repr(self.__arch__))
-		if address != None or permissions != None:
+		if address is not None or permissions is not None:
 			return self._allocate_mmap(size, address, permissions)
 		try:
 			return self._allocate_malloc(size)
-		except ProcessError:
+		except mayhem.proc.ProcessError:
 			return self._allocate_mmap(size, address, permissions)
 
 	def free(self, address):
-		if address in self.maps:
-			memregion = self.maps[address]
+		memregion = self.maps.get(address)
+		if memregion:
 			self._free_munmap(address, (memregion.addr_high - memregion.addr_low))
 		else:
 			self._free_free(address)
@@ -742,7 +721,6 @@ class LinuxProcess(Process):
 		result = self._call_function(mprotect_addr, address, size, permissions)
 		if result != 0:
 			raise LinuxProcessError('Error: mprotect')
-		self._update_maps()
 		return
 
 	def start_thread(self, address, targ=None):
@@ -782,11 +760,10 @@ class LinuxProcess(Process):
 		if result == 0:
 			raise LinuxProcessError('Error: failed to load: ' + repr(libpath))
 		self._free_free(readable_address)
-		self._update_maps()
 		return result
 
 	def read_memory(self, address, size=0x400):
-		data = ''
+		data = b''
 		address_cursor = address
 		size_of_long = ctypes.sizeof(ctypes.c_long)
 		while len(data) < size:
@@ -808,11 +785,11 @@ class LinuxProcess(Process):
 			address_cursor -= sz_overlap
 			data = self.read_memory(address_cursor, sz_overlap) + data
 		sz_overlap = size_of_long - ((address_cursor + len(data)) % size_of_long)
-		if sz_overlap > 0 and sz_overlap < 8:
+		if 0 < sz_overlap < 8:
 			data = data + self.read_memory(address_cursor + len(data), sz_overlap)
-		for idx in xrange(0, len(data), size_of_long):
+		for idx in range(0, len(data), size_of_long):
 			data_chunk = data[idx:(idx + size_of_long)]
 			data_chunk = struct.unpack('l', data_chunk)[0]
 			if self._ptrace(PTRACE_POKEDATA, address_cursor + idx, data_chunk) != 0:
 				raise LinuxProcessError('Error: PTRACE_POKEDATA', errno=get_errno())
-		return None
+		return
